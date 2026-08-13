@@ -15,15 +15,16 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// ---------- Конфигурация ----------
+// ---------- КОНФИГУРАЦИЯ (ИЗМЕНИТЕ IP) ----------
 const (
-	switchIP = "192.168.121.2"
-	password = "123asd456" // оставлен в коде по вашему желанию
+	switchIP = "192.168.121.2" // <-- УКАЖИТЕ ПРАВИЛЬНЫЙ IP КОММУТАТОРА
+	password = "123asd456"
 
 	loginCallCmd  = 123
 	toggleCallCmd = 103
 
 	httpTimeout = 10 * time.Second
+	numPorts    = 6 // только порты 1..6, порты 7 и 8 не трогаем
 )
 
 // ---------- WinAPI константы ----------
@@ -74,7 +75,7 @@ const (
 	statusHeight = 80
 )
 
-// ---------- Структуры для WinAPI ----------
+// ---------- Структуры WinAPI ----------
 type point struct {
 	X int32
 	Y int32
@@ -110,14 +111,14 @@ var (
 	statusWindow uintptr
 	applyButton  uintptr
 
-	selectedPort int
+	selectedPort int // 0 = все выключить, 1..numPorts = номер порта
 	mu           sync.Mutex
 
 	cancelCtx  context.Context
 	cancelFunc context.CancelFunc
 )
 
-// ---------- Вспомогательные функции WinAPI ----------
+// ---------- Импорт функций WinAPI ----------
 var (
 	user32 = windows.NewLazySystemDLL("user32.dll")
 
@@ -257,14 +258,15 @@ func (c *SwitchClient) Login() error {
 	return nil
 }
 
+// Опкоды для 8-портового коммутатора (формулы не меняются)
 func (c *SwitchClient) opcodeOff(port int) int {
 	return 16 * (8 - port)
 }
-
 func (c *SwitchClient) opcodeOn(port int) int {
 	return c.opcodeOff(port) + 2560
 }
 
+// Toggle отправляет команду включения/выключения на указанный порт
 func (c *SwitchClient) Toggle(port int, state bool) error {
 	c.mu.Lock()
 	cookie := c.cookie
@@ -319,7 +321,7 @@ func (c *SwitchClient) Toggle(port int, state bool) error {
 	return nil
 }
 
-// ---------- GUI логика ----------
+// ---------- GUI Логика ----------
 func postStatusMessage(text string) {
 	procSendMessage.Call(mainWindow, wmApp, 0, uintptr(unsafe.Pointer(utf16Ptr(text))))
 }
@@ -332,6 +334,7 @@ func postEnableApply(enabled bool) {
 	procSendMessage.Call(mainWindow, wmApp, 1, v)
 }
 
+// applySelection – выключаем все порты 1..numPorts, затем включаем выбранный (если выбран)
 func applySelection(ctx context.Context) {
 	postEnableApply(false)
 	postStatusMessage("Применение...")
@@ -345,7 +348,8 @@ func applySelection(ctx context.Context) {
 			return
 		}
 
-		for p := 1; p <= 8; p++ {
+		// Шаг 1: выключаем все порты 1..numPorts (порты 7 и 8 не трогаем)
+		for p := 1; p <= numPorts; p++ {
 			select {
 			case <-ctx.Done():
 				postStatusMessage("Отмена")
@@ -360,20 +364,24 @@ func applySelection(ctx context.Context) {
 			}
 		}
 
+		// Шаг 2: если выбран порт от 1 до numPorts – включаем его
 		mu.Lock()
 		port := selectedPort
 		mu.Unlock()
 
-		if port >= 1 && port <= 8 {
+		if port >= 1 && port <= numPorts {
 			if err := client.Toggle(port, true); err != nil {
 				postStatusMessage(fmt.Sprintf("Ошибка ON порт %d: %v", port, err))
 				postEnableApply(true)
 				return
 			}
-			postStatusMessage(fmt.Sprintf("Готово: порт %d включён", port))
+			postStatusMessage(fmt.Sprintf("Готово: порт %d включён, остальные 1..%d выключены", port, numPorts))
+		} else if port == 0 {
+			postStatusMessage(fmt.Sprintf("Готово: все порты 1..%d выключены", numPorts))
 		} else {
-			postStatusMessage("Готово: все порты выключены")
+			postStatusMessage("Ошибка: неверный выбор порта")
 		}
+
 		postEnableApply(true)
 	}()
 }
@@ -382,7 +390,8 @@ func applySelection(ctx context.Context) {
 func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 	switch msg {
 	case wmCreate:
-		for i := 1; i <= 8; i++ {
+		// Радио-кнопки для портов 1..numPorts
+		for i := 1; i <= numPorts; i++ {
 			id := idPort1 + i - 1
 			x := radioLeft
 			y := 30 + (i-1)*radioOffset
@@ -394,13 +403,15 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 				id, hwnd,
 			)
 		}
+		// Кнопка "Все выключить"
 		createControl(
 			"BUTTON",
 			"Все выключить",
 			wsChild|wsVisible|bsAutoRadioButton,
-			radioLeft, 320, radioWidth, radioHeight,
+			radioLeft, 30+numPorts*radioOffset, radioWidth, radioHeight,
 			idAllOff, hwnd,
 		)
+		// Кнопка "Применить"
 		applyButton = createControl(
 			"BUTTON",
 			"ПРИМЕНИТЬ",
@@ -408,6 +419,7 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 			applyLeft, applyTop, applyWidth, applyHeight,
 			idApply, hwnd,
 		)
+		// Статус
 		statusWindow = createControl(
 			"STATIC",
 			"Не подключено",
@@ -422,7 +434,7 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 		code := uint32((wParam >> 16) & 0xffff)
 
 		if code == bnClicked {
-			if id >= idPort1 && id <= idPort1+7 {
+			if id >= idPort1 && id <= idPort1+numPorts-1 {
 				mu.Lock()
 				selectedPort = id - idPort1 + 1
 				mu.Unlock()
@@ -482,7 +494,7 @@ func main() {
 	mainWindow, _, _ = procCreateWindowEx.Call(
 		0,
 		uintptr(unsafe.Pointer(className)),
-		uintptr(unsafe.Pointer(utf16Ptr("SEVEN 8GE"))),
+		uintptr(unsafe.Pointer(utf16Ptr("SEVEN 8GE (порты 1-6)"))),
 		wsOverlapped|wsCaption|wsSysMenu|wsMinimize,
 		windowX, windowY, windowWidth, windowHeight,
 		0, 0, instance, 0,
