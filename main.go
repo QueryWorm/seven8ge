@@ -502,6 +502,6 @@ func main() {
 			break
 		}
 		procTranslateMsg.Call(uintptr(unsafe.Pointer(&m)))
-		procDispatchMsg.Call(uintptr(unsafe.Pointer(&m)))
+		procDispatchMessage.Call(uintptr(unsafe.Pointer(&m)))
 	}
 }
